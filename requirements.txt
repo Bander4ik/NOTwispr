@@ -1,0 +1,5 @@
+google-genai>=1.0.0
+pyaudio
+pynput
+pyperclip
+python-dotenv

@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.wav
+*.pcm
+dist/
+build/
+*.egg-info/
