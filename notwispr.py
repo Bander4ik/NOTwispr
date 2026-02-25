@@ -45,9 +45,9 @@ if not GEMINI_API_KEY:
 # Модель — обов'язково повний ID для потрапляння у безкоштовну квоту Native Audio
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 
-# Хоткей — push-to-talk
-HOTKEY_MODIFIER = Key.alt_l   # Left Alt
-HOTKEY_KEY = "q"              # Q
+# Хоткей — перемикач (toggle)
+# Left Alt + Q
+HOTKEY_COMBO = "<alt_l>+q"
 
 # Аудіо: PCM 16-bit, 16kHz, mono (вимога Gemini Live API)
 AUDIO_FORMAT = pyaudio.paInt16
@@ -55,11 +55,18 @@ AUDIO_CHANNELS = 1
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1024
 
-# Затримка між натисканнями при друкуванні (секунди)
+# Затримка між натисканнями при друкуванні (секунди, для fallback режиму)
 TYPE_DELAY = 0.005
+
+# Затримка фіналізації (секунди) для захоплення останніх слів після відпускання кнопки
+STOP_DELAY = 1.0
 
 # ДЕБАГ РЕЖИМ (включіть True, щоб бачити сирі відповіді API)
 DEBUG_MODE = True
+
+# Поріг гучності. Все, що нижче - тиша (настроїш під свій мікрофон)
+# Для потужних мікрофонів біля рота оптимально 30-45
+SILENCE_THRESHOLD = 40.0
 
 # Системний промпт для Gemini (точна копія з вимог — не змінювати!)
 SYSTEM_INSTRUCTION = (
@@ -77,200 +84,202 @@ SYSTEM_INSTRUCTION = (
 
 
 class AudioRecorder:
-    """Захоплює аудіо з мікрофону у буфер (push-to-talk)."""
-
-    def __init__(self):
+    """Захоплює аудіо, ріже тишу скальпелем і пушить у чергу на льоту."""
+    def __init__(self, loop: asyncio.AbstractEventLoop, audio_queue: asyncio.Queue):
         self._pya = pyaudio.PyAudio()
         self._stream = None
-        self._frames: list[bytes] = []
         self._recording = False
+        self._mute_debug = False # Чи перестати малювати крапки
         self._lock = threading.Lock()
+        self._loop = loop
+        self._audio_queue = audio_queue
 
-    def start(self):
-        """Починає запис з дефолтного мікрофону."""
+    def set_mute_debug(self, mute: bool):
+        """Зупиняє малювання крапок (коли текст вже отримано)."""
+        self._mute_debug = mute
+
+    def _get_rms(self, data: bytes) -> float:
+        """Обчислює гучність чанку."""
+        import struct
+        import math
+        count = len(data) // 2
+        shorts = struct.unpack("%dh" % count, data)
+        sum_squares = sum(s**2 for s in shorts)
+        return math.sqrt(sum_squares / count) if count > 0 else 0.0
+
+    def start(self) -> bool:
+        """Відкриває мікрофон. Повертає True, якщо ОК."""
         with self._lock:
-            if self._recording:
-                return
-            self._frames = []
+            if self._recording: return True
             self._recording = True
-
+            self._mute_debug = False
+        
         try:
-            mic_info = self._pya.get_default_input_device_info()
             self._stream = self._pya.open(
                 format=AUDIO_FORMAT,
                 channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE,
                 input=True,
-                input_device_index=int(mic_info["index"]),
-                frames_per_buffer=AUDIO_CHUNK,
+                frames_per_buffer=AUDIO_CHUNK
             )
+            # Запускаємо цикл читання, якщо він не активний
+            if not hasattr(self, "_read_thread") or not self._read_thread.is_alive():
+                self._read_thread = threading.Thread(target=self._run_read_loop, daemon=True)
+                self._read_thread.start()
+            return True
         except Exception as e:
-            print(f"❌ Не вдалося відкрити мікрофон: {e}")
+            print(f"❌ Помилка мікрофону: {e}")
+            with self._lock: self._recording = False
+            return False
+
+    def _run_read_loop(self):
+        """Фоновий цикл читання аудіо."""
+        while True:
             with self._lock:
-                self._recording = False
-            return
-
-        # Читаємо аудіо у фоновому потоці
-        def _read_loop():
-            while True:
-                with self._lock:
-                    if not self._recording:
-                        break
-                try:
-                    data = self._stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-                    self._frames.append(data)
-                except Exception:
-                    break
-
-        self._read_thread = threading.Thread(target=_read_loop, daemon=True)
-        self._read_thread.start()
-
-    def stop(self) -> bytes:
-        """Зупиняє запис і повертає зібране аудіо як bytes."""
-        with self._lock:
-            self._recording = False
-
-        if hasattr(self, "_read_thread"):
-            self._read_thread.join(timeout=2.0)
-
-        if self._stream:
+                if not self._recording and not self._stream: 
+                    break # Повністю виходимо, якщо запис вимкнено і стрім закрито
+                if not self._recording:
+                    time.sleep(0.1)
+                    continue
+            
             try:
-                self._stream.stop_stream()
-                self._stream.close()
+                if self._stream:
+                    data = self._stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                    rms = self._get_rms(data)
+                    
+                    if rms > SILENCE_THRESHOLD:
+                        if DEBUG_MODE and not self._mute_debug:
+                            print(".", end="", flush=True) 
+                        self._loop.call_soon_threadsafe(self._audio_queue.put_nowait, data)
             except Exception:
-                pass
-            self._stream = None
+                break
 
-        audio_data = b"".join(self._frames)
-        self._frames = []
-        return audio_data
+    def stop(self):
+        """Зупиняє запис з невеликою затримкою, щоб встигнути дослухати останнє слово."""
+        def _delayed_stop():
+            if STOP_DELAY > 0:
+                time.sleep(STOP_DELAY)
+            
+            with self._lock:
+                if not self._recording: return
+                self._recording = False
 
-    @property
-    def is_recording(self) -> bool:
-        with self._lock:
-            return self._recording
+            # Сигнал закінчення аудіо для API
+            self._loop.call_soon_threadsafe(self._audio_queue.put_nowait, b"END_OF_STREAM")
+
+            if self._stream:
+                try:
+                    s = self._stream
+                    self._stream = None
+                    s.stop_stream()
+                    s.close()
+                except Exception:
+                    pass
+            if hasattr(self, "_read_thread"):
+                self._read_thread.join(timeout=0.5)
+
+        threading.Thread(target=_delayed_stop, daemon=True).start()
 
     def terminate(self):
-        """Звільняє ресурси PyAudio."""
         try:
-            if self._stream:
-                self._stream.close()
-        except Exception:
+            self._pya.terminate()
+        except:
             pass
-        self._pya.terminate()
-
-    def get_rms(self, debug_frames: bytes) -> float:
-        """Обчислює RMS (середньоквадратичну гучність) для перевірки мікрофону."""
-        import math
-        import struct
-        if not debug_frames:
-            return 0.0
-        count = len(debug_frames) // 2
-        format = "%dh" % count
-        shorts = struct.unpack(format, debug_frames)
-        sum_squares = sum(s**2 for s in shorts)
-        return math.sqrt(sum_squares / count) if count > 0 else 0.0
 
 
 # ─────────────────────────── GeminiTranscriber ──────────────────────
 
 
 class GeminiTranscriber:
-    """Відправляє аудіо в Gemini Live API і отримує ТІЛЬКИ текстову транскрипцію."""
-
+    """Підтримує постійний стрім. Віддає текст, коли стрім закінчено."""
     def __init__(self):
         self._client = genai.Client(api_key=GEMINI_API_KEY)
-        # Повертаємо AUDIO модальність (необхідна для обробки голосу)
-        # та вмикаємо обидва види транскрипції.
-        # Видаляємо explicit_vad_signal, бо модель його не підтримує.
         self._config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=SYSTEM_INSTRUCTION,
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=types.AudioTranscriptionConfig()
         )
 
-    async def transcribe(self, audio_data: bytes, rms_val: float) -> str:
-        if not audio_data:
-            return ""
-
-        print(f"DEBUG: Відправка {len(audio_data)} байт (Гучність RMS: {rms_val:.1f})")
-        if rms_val < 10:
-            print("⚠️  УВАГА: Дуже низький сигнал мікрофону. Можливо, Gemini нічого не почує.")
-
-        input_text_parts: list[str] = []
-        model_text_parts: list[str] = []
-        
+    async def stream_and_transcribe(self, audio_queue: asyncio.Queue) -> str:
+        input_text_parts = []
+        model_text_parts = []
         try:
-            # Напряму використовуємо WebSocket підключення
             async with self._client.aio.live.connect(model=MODEL, config=self._config) as session:
                 if DEBUG_MODE:
-                    print("DEBUG: WebSocket з'єднання встановлено.")
+                    print("DEBUG: З'єднання відкрито, готовий слухати.")
 
                 async def send_audio():
                     try:
-                        # Відправляємо все аудіо одним блоком і сигналізуємо про кінець.
-                        await session.send_realtime_input(
-                            audio={"data": audio_data, "mime_type": "audio/pcm"}
-                        )
-                        await session.send_realtime_input(audio_stream_end=True)
+                        while True:
+                            # Чекаємо чанк з черги
+                            chunk = await audio_queue.get()
+                            if chunk == b"END_OF_STREAM":
+                                if DEBUG_MODE: print("\nDEBUG: Кінець аудіо-потоку.")
+                                try:
+                                    await session.send_realtime_input(audio_stream_end=True)
+                                except: pass
+                                break
+                            
+                            # Стрімимо шматки аудіо на льоту
+                            # Вказуємо rate для надійності
+                            await session.send_realtime_input(
+                                audio={"data": chunk, "mime_type": "audio/pcm;rate=16000"}
+                            )
                     except Exception as e:
-                        if DEBUG_MODE:
-                            print(f"DEBUG: Помилка у send_audio: {e}")
+                        if DEBUG_MODE: print(f"\nDEBUG send_audio error: {e}")
 
                 async def receive_responses():
                     try:
                         async for response in session.receive():
-                            if DEBUG_MODE:
-                                print(f"DEBUG API MSG: {response}")
-                            
                             sc = response.server_content
                             if not sc: continue
 
-                            # 1. Швидкий STT потік (сайд-кар)
                             if sc.input_transcription and sc.input_transcription.text:
-                                input_text_parts.append(sc.input_transcription.text)
-                            
-                            # 2. Відповідь моделі (повільніше, але може бути точніше)
-                            if sc.model_turn and sc.model_turn.parts:
-                                for part in sc.model_turn.parts:
-                                    if hasattr(part, "text") and part.text:
-                                        if not getattr(part, "thought", False):
-                                            model_text_parts.append(part.text)
-                            
-                            # Перевіряємо turn_complete для негайного завершення
-                            if sc.turn_complete:
-                                break
-                    except Exception as e:
-                        if DEBUG_MODE:
-                            print(f"DEBUG: Помилка у receive_responses: {e}")
+                                text = sc.input_transcription.text
+                                input_text_parts.append(text)
+                                if DEBUG_MODE:
+                                    print(f"| {text}", end="", flush=True)
 
-                # Запуск задач
+                            # Виходимо одразу як Gemini сигналізує про завершення ходу.
+                            # Це усуває затримку 20-40с.
+                            if sc.turn_complete:
+                                if DEBUG_MODE: print("\nDEBUG: turn_complete отримано, виходимо.")
+                                break
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        if DEBUG_MODE: print(f"\nDEBUG receive error: {e}")
+
+                # Запускаємо надсилання та отримання паралельно через таски
                 send_task = asyncio.create_task(send_audio())
                 receive_task = asyncio.create_task(receive_responses())
+
+                # Чекаємо, поки все аудіо з черги піде в мережу (включно з STOP_DELAY)
+                await send_task
                 
-                # Чекаємо завершення (STT зазвичай вкладається в 10-15 сек)
-                await asyncio.wait([send_task, receive_task], timeout=20.0)
+                # Чекаємо або turn_complete (швидкий шлях), або таймаут як fallback.
+                # 5 секунд більш ніж достатньо — якщо turn_complete не прийшов, щось пішло не так.
+                finish_timeout = 5.0
+                try:
+                    await asyncio.wait_for(asyncio.shield(receive_task), timeout=finish_timeout)
+                except asyncio.TimeoutError:
+                    if DEBUG_MODE: print(f"\nDEBUG: Очікування фіналізації завершено по таймауту {finish_timeout}с.")
+                finally:
+                    if not receive_task.done():
+                        receive_task.cancel()
+                        try: await receive_task
+                        except: pass
 
         except Exception as e:
             print(f"❌ Помилка Gemini API: {e}")
             return ""
 
-        # Пріоритет на швидкість: якщо є input_transcription, беремо її
-        # Вона приходить частинами, які Gemini вже розділив пробілами
-        if input_text_parts:
-            full_text = "".join(input_text_parts).strip()
-        elif model_text_parts:
-            # Якщо STT потік порожній, беремо результат моделі
-            full_text = "".join(model_text_parts).strip()
-        else:
-            return ""
-        if not full_text:
+        if not input_text_parts:
             return ""
 
-        # Чистка від артефактів моделі
+        full_text = "".join(input_text_parts).strip()
+
         import re
-        # Видаляємо все в подвійних зірочках (залишки thoughts)
         full_text = re.sub(r"\*\*.*?\*\*", "", full_text, flags=re.DOTALL)
         
         # Видаляємо фрази-маркери Gemini
@@ -286,17 +295,12 @@ class GeminiTranscriber:
         for pattern in boilerplate:
             full_text = re.sub(pattern, "", full_text, flags=re.IGNORECASE | re.DOTALL)
 
-        # Розбиваємо на блоки і вибираємо останній (якщо модель повторила фразу після коментаря)
-        # Або шукаємо блок, де є кирилиця
         blocks = [b.strip() for b in full_text.split("\n") if b.strip()]
         if not blocks: return ""
         
-        # Пріоритет: останній блок, що містить кирилицю
         for block in reversed(blocks):
             if re.search(r'[а-яА-ЯіїєґІЇЄҐ]', block):
-                # Прибираємо лапки, якщо модель їх додала
                 return block.strip(' "«»')
-        
         return blocks[-1].strip(' "«»')
 
 
@@ -353,50 +357,55 @@ class TextInjector:
 
 
 class HotkeyManager:
-    """Push-to-talk: тримаєш Alt+Q = пишеш, відпустив = транскрипція."""
+    """Перемикач (Toggle): натиснув Alt+Q — почав, натиснув ще раз — зупинив.
+    Використовуємо Listener, бо він надійніший за GlobalHotKeys на Windows.
+    """
 
-    def __init__(self, on_start, on_stop):
-        self._on_start = on_start
-        self._on_stop = on_stop
-        self._modifier_pressed = False
-        self._hotkey_active = False
+    def __init__(self, on_toggle):
+        self._on_toggle = on_toggle
         self._listener = None
+        self._alt_pressed = False
+        self._q_pressed = False
 
     def _on_press(self, key):
-        # Перевіряємо модифікатор (Left Alt)
-        if key == HOTKEY_MODIFIER:
-            self._modifier_pressed = True
+        # Перевіряємо Alt (будь-який)
+        if key in (Key.alt_l, Key.alt_r, Key.alt, Key.alt_gr):
+            self._alt_pressed = True
             return
 
-        # Перевіряємо основну клавішу (Q)
         try:
-            if hasattr(key, "char") and key.char == HOTKEY_KEY:
-                if self._modifier_pressed and not self._hotkey_active:
-                    self._hotkey_active = True
-                    self._on_start()
-        except AttributeError:
+            # Перевіряємо Q (ігноруючи розкладку через vk або порівняння char)
+            is_q = False
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+                is_q = True
+            elif hasattr(key, 'vk') and key.vk == 81: # VK_Q = 81
+                is_q = True
+            
+            if is_q:
+                if self._alt_pressed and not self._q_pressed:
+                    self._q_pressed = True
+                    self._on_toggle()
+        except Exception:
             pass
 
     def _on_release(self, key):
-        # Відпустили модифікатор
-        if key == HOTKEY_MODIFIER:
-            self._modifier_pressed = False
-            if self._hotkey_active:
-                self._hotkey_active = False
-                self._on_stop()
-            return
-
-        # Відпустили основну клавішу
+        if key in (Key.alt_l, Key.alt_r, Key.alt, Key.alt_gr):
+            self._alt_pressed = False
+        
         try:
-            if hasattr(key, "char") and key.char == HOTKEY_KEY:
-                if self._hotkey_active:
-                    self._hotkey_active = False
-                    self._on_stop()
-        except AttributeError:
+            is_q = False
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+                is_q = True
+            elif hasattr(key, 'vk') and key.vk == 81:
+                is_q = True
+            
+            if is_q:
+                self._q_pressed = False
+        except Exception:
             pass
 
     def start(self):
-        """Запускає слухача хоткеїв у фоновому потоці."""
+        """Запускає слухача у фоновому потоці."""
         self._listener = keyboard.Listener(
             on_press=self._on_press,
             on_release=self._on_release,
@@ -405,7 +414,6 @@ class HotkeyManager:
         self._listener.start()
 
     def stop(self):
-        """Зупиняє слухача."""
         if self._listener:
             self._listener.stop()
 
@@ -417,58 +425,76 @@ class NOTwispr:
     """Головний клас — зв'язує всі модулі разом."""
 
     def __init__(self):
-        self._recorder = AudioRecorder()
+        self._recorder = None
         self._transcriber = GeminiTranscriber()
         self._injector = TextInjector()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._audio_queue: asyncio.Queue | None = None
         self._hotkey = HotkeyManager(
-            on_start=self._handle_start,
-            on_stop=self._handle_stop,
+            on_toggle=self._handle_toggle,
         )
+        self._is_recording = False
+        self._is_processing = False
+        self._state_lock = threading.Lock()
 
-    def _handle_start(self):
-        """Callback: натиснуто хоткей — почати запис."""
-        print("🎙️  Запис...")
-        self._recorder.start()
-
-    def _handle_stop(self):
-        """Callback: відпущено хоткей — зупинити запис і транскрибувати."""
-        audio_data = self._recorder.stop()
-
-        if not audio_data:
-            print("⚠️  Порожній запис, пропускаю.")
+    def _handle_toggle(self):
+        """Callback: перемикання стану запису."""
+        if not self._loop or not self._audio_queue:
             return
 
-        duration_sec = len(audio_data) / (AUDIO_RATE * 2)  # 2 bytes per sample
-        print(f"⏹️  Зупинено ({duration_sec:.1f}с). Транскрибую...")
+        with self._state_lock:
+            if self._is_recording:
+                # Зупиняємо
+                if self._recorder:
+                    self._recorder.stop()
+                self._is_recording = False
+                if DEBUG_MODE: print("\nDEBUG: Натиснуто Стоп.")
+            else:
+                # Починаємо
+                if self._is_processing:
+                    if DEBUG_MODE: print("\nDEBUG: Все ще обробляється попередній текст...")
+                    return
+                
+                if not self._recorder.start():
+                    return
+                
+                self._is_recording = True
+                self._is_processing = True
+                if DEBUG_MODE: print("\nDEBUG: Натиснуто Старт.")
 
-        # Обчислюємо RMS (гучність) для діагностики
-        rms_val = self._recorder.get_rms(audio_data)
+                # Очищуємо чергу
+                while not self._audio_queue.empty():
+                    try: self._audio_queue.get_nowait()
+                    except: break
+                
+                asyncio.run_coroutine_threadsafe(self._process(), self._loop)
 
-        # Запускаємо транскрипцію в asyncio event loop
-        if self._loop and self._loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                self._process(audio_data, rms_val), self._loop
-            )
-            # Не блокуємо потік хоткея — результат обробиться в _process
-        else:
-            print("⚠️  Event loop не запущено!")
-
-    async def _process(self, audio_data: bytes, rms_val: float):
-        """Транскрибує аудіо і вводить текст."""
+    async def _process(self):
+        """Транскрибує аудіо з черги і вводить текст."""
         try:
-            text = await self._transcriber.transcribe(audio_data, rms_val)
+            text = await self._transcriber.stream_and_transcribe(self._audio_queue)
+            if self._recorder:
+                self._recorder.set_mute_debug(True)
+            
             if text:
                 print(f"✅ Транскрипція: {text}")
                 self._injector.inject(text)
             else:
-                print("⚠️  Порожня транскрипція — можливо, тиша або помилка API.")
+                print("\n⚠️  Порожній результат.")
         except Exception as e:
-            print(f"❌ Помилка обробки: {e}")
+            print(f"\n❌ Помилка: {e}")
+        finally:
+            # Скидаємо прапорець обробки ПІСЛЯ завершення асинхронної задачі
+            with self._state_lock:
+                self._is_processing = False
 
     async def _run_forever(self):
-        """Тримає asyncio loop активним."""
+        """Тримає asyncio loop активним та ініціалізує асинхронні частини."""
         self._loop = asyncio.get_running_loop()
+        # Створюємо чергу саме в працюючому циклі!
+        self._audio_queue = asyncio.Queue()
+        self._recorder = AudioRecorder(self._loop, self._audio_queue)
+        
         try:
             while True:
                 await asyncio.sleep(1)
@@ -481,14 +507,14 @@ class NOTwispr:
         print("  🎤 NOTwispr — Голосовий диктатор")
         print("=" * 55)
         print(f"  Модель:  {MODEL}")
-        print(f"  Хоткей:  Left Alt + Q (тримайте для запису)")
+        print(f"  Хоткей:  Left Alt + Q (натиснути для старт/стоп)")
         print(f"  Вихід:   Ctrl+C")
         print("=" * 55)
         print()
 
         # Запускаємо слухача хоткеїв
         self._hotkey.start()
-        print("✅ Готово! Тримайте Left Alt + Q для запису голосу.\n")
+        print("✅ Готово! Натисніть Left Alt + Q для запису.\n")
 
         # Запускаємо головний asyncio loop
         try:
