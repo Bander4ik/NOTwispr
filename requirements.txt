@@ -1,4 +1,4 @@
-google-genai>=1.0.0
+deepgram-sdk>=3.0.0
 pyaudio
 pynput
 pyperclip
