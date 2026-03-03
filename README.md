@@ -6,6 +6,9 @@
 [![Deepgram](https://img.shields.io/badge/Deepgram-Nova--3-purple)](https://deepgram.com)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-Guide-silver?logo=apple)](README_MAC.md)
+
+> 🍎 **macOS users:** see the [macOS Installation Guide](README_MAC.md) for platform-specific setup steps.
 
 ---
 
